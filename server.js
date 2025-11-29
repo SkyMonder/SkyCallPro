@@ -86,6 +86,7 @@ async function refreshUsers(q='') {
     item.querySelector('.btn-call-user').onclick = () => initiateCallTo(u.username);
     item.querySelector('.btn-chat').onclick = () => openChatWith(u.username);
   });
+}
 
 // message history between a and b
 app.get('/api/messages', (req, res) => {
