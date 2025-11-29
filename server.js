@@ -63,10 +63,29 @@ app.post('/api/login', (req, res) => {
 });
 
 // search users
-app.get('/api/users', (req, res) => {
-  const q = req.query.q || '';
-  res.json(listUsers(q));
-});
+async function refreshUsers(q='') {
+  const res = await fetch('/api/users?q=' + encodeURIComponent(q || ''));
+  const list = await res.json();
+  usersListEl.innerHTML = '';
+  list.forEach(u => {
+    const item = document.createElement('div'); 
+    item.className = 'user-item';
+    item.innerHTML = `
+      <div style="display:flex;gap:10px;align-items:center">
+        <div style="width:36px;height:36px;border-radius:8px;background:linear-gradient(135deg,#7c5cff,#4ce1b6);display:flex;align-items:center;justify-content:center;font-weight:700;color:#041025">${u.username[0].toUpperCase()}</div>
+        <div><div style="font-weight:700">${u.displayName}</div><div class="muted small">${u.username}</div></div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end">
+        <div class="status-dot ${u.online ? 'online' : 'offline'}"></div>
+        <div style="margin-top:8px;display:flex;gap:6px">
+          <button class="ghost btn-chat" data-user="${u.username}">Чат</button>
+          <button class="btn-call-user" data-user="${u.username}">Позвонить</button>
+        </div>
+      </div>`;
+    usersListEl.appendChild(item);
+    item.querySelector('.btn-call-user').onclick = () => initiateCallTo(u.username);
+    item.querySelector('.btn-chat').onclick = () => openChatWith(u.username);
+  });
 
 // message history between a and b
 app.get('/api/messages', (req, res) => {
