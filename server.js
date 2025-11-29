@@ -1,44 +1,90 @@
 // server.js
-// SkyMessage — single-file server + client (Socket.IO + WebRTC + Chat)
-// Demo: in-memory users/messages. For production: add DB, HTTPS, TURN, password hashing.
-// Usage:
-//   npm init -y
-//   npm install express socket.io cookie-parser
-//   node server.js
-//
-// On Render set Start Command: npm start (or node server.js)
+// SkyMessage — single-file server + embedded client + SQLite
+// Dependencies: express, socket.io, cookie-parser, sqlite3
+// Install: npm install express socket.io cookie-parser sqlite3
+// Run: node server.js
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cookieParser = require('cookie-parser');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
 const PORT = process.env.PORT || 3000;
+const DB_FILE = path.join(__dirname, 'skymessage.db');
 
-// ---------------- In-memory storage (demo only) ----------------
-const users = {}; // username -> { password, displayName, socketId|null }
-const messages = []; // { from, to, text, ts }
+// ----------------- SQLite init -----------------
+const db = new sqlite3.Database(DB_FILE, (err) => {
+  if (err) {
+    console.error('Failed to open DB', err);
+    process.exit(1);
+  }
+});
 
-// Helper: list users with 'online' flag
-function listUsers(q = '') {
-  const ql = (q || '').toLowerCase();
-  return Object.keys(users)
-    .filter(u => !ql || u.toLowerCase().includes(ql))
-    .map(u => ({ username: u, displayName: users[u].displayName || u, online: !!users[u].socketId }));
+db.serialize(() => {
+  // users: username unique, password (plaintext for demo), displayName, created_at
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password TEXT NOT NULL,
+    displayName TEXT,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  )`);
+
+  // messages: persisted chat messages
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_user TEXT NOT NULL,
+    to_user TEXT NOT NULL,
+    text TEXT NOT NULL,
+    ts INTEGER DEFAULT (strftime('%s','now'))
+  )`);
+
+  // call_logs optional
+  db.run(`CREATE TABLE IF NOT EXISTS call_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    caller TEXT,
+    callee TEXT,
+    ts_start INTEGER,
+    ts_end INTEGER
+  )`);
+});
+
+// ----------------- In-memory runtime maps -----------------
+// socket.id -> username
+const socketToUser = {};
+// username -> socket.id
+const userSockets = {};
+
+// Helper: list users with online flag, search by substring
+function listUsersSql(q = '') {
+  return new Promise((resolve, reject) => {
+    const like = '%' + (q || '') + '%';
+    db.all(
+      `SELECT username, displayName FROM users WHERE username LIKE ? OR displayName LIKE ? ORDER BY username LIMIT 200`,
+      [like, like],
+      (err, rows) => {
+        if (err) return reject(err);
+        const res = rows.map(r => ({
+          username: r.username,
+          displayName: r.displayName || r.username,
+          online: !!userSockets[r.username]
+        }));
+        resolve(res);
+      }
+    );
+  });
 }
 
-// ---------------- HTTP routes ----------------
+// ----------------- HTTP API -----------------
 
-// small svg favicon to prevent /favicon.ico 404
+// tiny favicon (svg) to prevent 404 spam
 app.get('/favicon.ico', (req, res) => {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-    <rect fill="#3d7fff" width="64" height="64" rx="8"/>
-    <text x="50%" y="54%" font-size="34" fill="white" font-family="Arial" text-anchor="middle">SM</text>
-  </svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect fill="#3d7fff" width="64" height="64" rx="8"/><text x="50%" y="54%" font-size="28" fill="white" font-family="Arial" text-anchor="middle">SM</text></svg>`;
   res.type('image/svg+xml').send(svg);
 });
 
@@ -46,103 +92,133 @@ app.get('/favicon.ico', (req, res) => {
 app.post('/api/register', (req, res) => {
   const { username, password, displayName } = req.body || {};
   if (!username || !password) return res.status(400).json({ ok: false, error: 'username & password required' });
-  if (users[username]) return res.status(409).json({ ok: false, error: 'username taken' });
-  users[username] = { password, displayName: displayName || username, socketId: null };
-  return res.json({ ok: true });
+  db.run(
+    `INSERT INTO users (username, password, displayName) VALUES (?, ?, ?)`,
+    [username, password, displayName || username],
+    function (err) {
+      if (err) {
+        if (err.code === 'SQLITE_CONSTRAINT') return res.status(409).json({ ok: false, error: 'username taken' });
+        console.error('DB insert user err', err);
+        return res.status(500).json({ ok: false, error: 'db error' });
+      }
+      return res.json({ ok: true });
+    }
+  );
 });
 
 // login
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ ok: false, error: 'username & password required' });
-  const u = users[username];
-  if (!u || u.password !== password) return res.status(401).json({ ok: false, error: 'invalid credentials' });
-  // demo: set cookie (not secure). For production use secure sessions.
-  res.cookie('username', username, { httpOnly: false });
-  return res.json({ ok: true, username, displayName: u.displayName });
+  db.get(`SELECT username, displayName FROM users WHERE username = ? AND password = ?`, [username, password], (err, row) => {
+    if (err) {
+      console.error('DB get user err', err);
+      return res.status(500).json({ ok: false, error: 'db error' });
+    }
+    if (!row) return res.status(401).json({ ok: false, error: 'invalid credentials' });
+    // set cookie (demo)
+    res.cookie('username', username, { httpOnly: false });
+    res.json({ ok: true, username: row.username, displayName: row.displayName || row.username });
+  });
 });
 
 // search users
-async function refreshUsers(q='') {
-  const res = await fetch('/api/users?q=' + encodeURIComponent(q || ''));
-  const list = await res.json();
-  usersListEl.innerHTML = '';
-  list.forEach(u => {
-    const item = document.createElement('div'); 
-    item.className = 'user-item';
-    item.innerHTML = `
-      <div style="display:flex;gap:10px;align-items:center">
-        <div style="width:36px;height:36px;border-radius:8px;background:linear-gradient(135deg,#7c5cff,#4ce1b6);display:flex;align-items:center;justify-content:center;font-weight:700;color:#041025">${u.username[0].toUpperCase()}</div>
-        <div><div style="font-weight:700">${u.displayName}</div><div class="muted small">${u.username}</div></div>
-      </div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end">
-        <div class="status-dot ${u.online ? 'online' : 'offline'}"></div>
-        <div style="margin-top:8px;display:flex;gap:6px">
-          <button class="ghost btn-chat" data-user="${u.username}">Чат</button>
-          <button class="btn-call-user" data-user="${u.username}">Позвонить</button>
-        </div>
-      </div>`;
-    usersListEl.appendChild(item);
-    item.querySelector('.btn-call-user').onclick = () => initiateCallTo(u.username);
-    item.querySelector('.btn-chat').onclick = () => openChatWith(u.username);
-  });
-}
+app.get('/api/users', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  try {
+    const list = await listUsersSql(q);
+    res.json(list);
+  } catch (e) {
+    console.error('listUsersSql error', e);
+    res.status(500).json([]);
+  }
+});
 
 // message history between a and b
 app.get('/api/messages', (req, res) => {
   const { a, b } = req.query;
   if (!a || !b) return res.status(400).json({ ok: false, error: 'a and b required' });
-  const hist = messages.filter(m => (m.from === a && m.to === b) || (m.from === b && m.to === a)).slice(-500);
-  res.json({ ok: true, messages: hist });
+  db.all(
+    `SELECT from_user as fromUser, to_user as toUser, text, ts FROM messages
+     WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
+     ORDER BY ts ASC LIMIT 1000`,
+    [a, b, b, a],
+    (err, rows) => {
+      if (err) {
+        console.error('messages select err', err);
+        return res.status(500).json({ ok: false, error: 'db error' });
+      }
+      res.json({ ok: true, messages: rows });
+    }
+  );
 });
 
-// serve UI (embedded)
+// serve UI (embedded single file)
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(renderHTML());
 });
 
-// ---------------- Socket.IO (signaling + chat) ----------------
+// ----------------- Socket.IO (signaling & chat) -----------------
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const io = new Server(server, { /* default options */ });
 
-// socket.id -> username
-const socketToUser = {};
+// helper to send users-updated broadcast
+async function broadcastUsersUpdated() {
+  try {
+    const list = await listUsersSql('');
+    io.emit('users-updated', list);
+  } catch (e) {
+    console.warn('broadcastUsersUpdated fail', e);
+  }
+}
 
-io.on('connection', socket => {
+io.on('connection', (socket) => {
   console.log('socket connected', socket.id);
 
-  // client announces login to socket
-  socket.on('socket-login', username => {
-    if (!username || !users[username]) return;
-    users[username].socketId = socket.id;
+  // login announcement from client
+  socket.on('socket-login', (username) => {
+    if (!username) return;
     socketToUser[socket.id] = username;
-    console.log('socket-login', username);
-    io.emit('users-updated', listUsers(''));
+    userSockets[username] = socket.id;
+    console.log('socket-login', username, socket.id);
+    broadcastUsersUpdated();
   });
 
-  // client can register via socket
+  // register via socket (optional)
   socket.on('register', ({ username, password, displayName }, cb) => {
     if (!username || !password) return cb && cb({ ok: false, error: 'username & password required' });
-    if (users[username]) return cb && cb({ ok: false, error: 'username taken' });
-    users[username] = { password, displayName: displayName || username, socketId: socket.id };
-    socketToUser[socket.id] = username;
-    io.emit('users-updated', listUsers(''));
-    cb && cb({ ok: true });
+    db.run(`INSERT INTO users (username, password, displayName) VALUES (?, ?, ?)`, [username, password, displayName || username], function (err) {
+      if (err) {
+        if (err.code === 'SQLITE_CONSTRAINT') return cb && cb({ ok: false, error: 'username taken' });
+        console.error('register socket db err', err);
+        return cb && cb({ ok: false, error: 'db error' });
+      }
+      // auto-login socket
+      socketToUser[socket.id] = username;
+      userSockets[username] = socket.id;
+      broadcastUsersUpdated();
+      cb && cb({ ok: true });
+    });
   });
 
-  // search users via socket
-  socket.on('search-users', (q, cb) => {
-    cb && cb(listUsers(q));
+  // search users (socket)
+  socket.on('search-users', async (q, cb) => {
+    try {
+      const res = await listUsersSql(q || '');
+      cb && cb(res);
+    } catch (e) {
+      cb && cb([]);
+    }
   });
 
-  // call: ask server to notify callee
+  // call initiation
   socket.on('call', ({ to }, cb) => {
     const from = socketToUser[socket.id];
     if (!from) return cb && cb({ ok: false, error: 'not logged in' });
-    const target = users[to];
-    if (!target || !target.socketId) return cb && cb({ ok: false, error: 'user offline' });
-    io.to(target.socketId).emit('incoming-call', { from, displayName: users[from].displayName });
+    const targetSocket = userSockets[to];
+    if (!targetSocket) return cb && cb({ ok: false, error: 'user offline' });
+    io.to(targetSocket).emit('incoming-call', { from, displayName: null });
     cb && cb({ ok: true });
   });
 
@@ -150,101 +226,108 @@ io.on('connection', socket => {
   socket.on('offer', ({ to, sdp }) => {
     const from = socketToUser[socket.id];
     if (!from) return;
-    const t = users[to];
-    if (t && t.socketId) io.to(t.socketId).emit('offer', { from, sdp });
+    const targetSocket = userSockets[to];
+    if (targetSocket) io.to(targetSocket).emit('offer', { from, sdp });
   });
 
   // signaling: answer
   socket.on('answer', ({ to, sdp }) => {
     const from = socketToUser[socket.id];
     if (!from) return;
-    const t = users[to];
-    if (t && t.socketId) io.to(t.socketId).emit('answer', { from, sdp });
+    const targetSocket = userSockets[to];
+    if (targetSocket) io.to(targetSocket).emit('answer', { from, sdp });
   });
 
-  // ICE
+  // ice
   socket.on('ice-candidate', ({ to, candidate }) => {
     const from = socketToUser[socket.id];
     if (!from) return;
-    const t = users[to];
-    if (t && t.socketId) io.to(t.socketId).emit('ice-candidate', { from, candidate });
+    const targetSocket = userSockets[to];
+    if (targetSocket) io.to(targetSocket).emit('ice-candidate', { from, candidate });
   });
 
   // end-call
   socket.on('end-call', ({ to }) => {
     const from = socketToUser[socket.id];
     if (!from) return;
-    const t = users[to];
-    if (t && t.socketId) io.to(t.socketId).emit('end-call', { from });
+    const targetSocket = userSockets[to];
+    if (targetSocket) io.to(targetSocket).emit('end-call', { from });
+    // optionally record in call_logs (ts_start/ts_end not tracked here)
+    db.run(`INSERT INTO call_logs (caller, callee, ts_start, ts_end) VALUES (?, ?, ?, ?)`, [from, to, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000)], (err) => {
+      if (err) console.warn('insert call_logs err', err);
+    });
   });
 
-  // chat message
+  // chat message (persist + deliver)
   socket.on('chat-message', ({ to, text }, cb) => {
     const from = socketToUser[socket.id];
     if (!from) return cb && cb({ ok: false, error: 'not logged in' });
-    const ts = Date.now();
-    messages.push({ from, to, text, ts });
-    const t = users[to];
-    if (t && t.socketId) {
-      io.to(t.socketId).emit('chat-message', { from, text, ts });
-    }
-    // ack to sender
-    socket.emit('chat-acked', { to, text, ts });
-    cb && cb({ ok: true });
+    const ts = Math.floor(Date.now() / 1000);
+    db.run(`INSERT INTO messages (from_user, to_user, text, ts) VALUES (?, ?, ?, ?)`, [from, to, text, ts], function (err) {
+      if (err) {
+        console.error('insert message err', err);
+        return cb && cb({ ok: false, error: 'db error' });
+      }
+      // deliver to recipient if online
+      const targetSocket = userSockets[to];
+      if (targetSocket) io.to(targetSocket).emit('chat-message', { from, text, ts });
+      // ack to sender
+      socket.emit('chat-acked', { to, text, ts });
+      cb && cb({ ok: true });
+    });
   });
 
-  // disconnect
   socket.on('disconnect', () => {
-    const u = socketToUser[socket.id];
-    if (u && users[u]) {
-      users[u].socketId = null;
+    const username = socketToUser[socket.id];
+    if (username) {
       delete socketToUser[socket.id];
-      io.emit('users-updated', listUsers(''));
-      console.log('user disconnected', u);
+      delete userSockets[username];
+      console.log('user disconnected', username);
+      broadcastUsersUpdated();
     } else {
       console.log('socket disconnected', socket.id);
     }
   });
 });
 
-// ---------------- start ----------------
+// ----------------- start server -----------------
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`SkyMessage running on http://0.0.0.0:${PORT} (port ${PORT})`);
 });
 
-// ---------------- client HTML (embedded) ----------------
+// ----------------- Embedded client HTML/JS -----------------
 function renderHTML() {
   return `<!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>SkyMessage — WebRTC + Chat</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SkyMessage (SQLite)</title>
 <style>
-  :root{--bg:#071026;--card:#0d1726;--muted:#9aa9c3;--accent:#7c5cff;--danger:#ff6b6b}
-  *{box-sizing:border-box;font-family:Inter, Arial, sans-serif}
-  body{margin:0;background:linear-gradient(180deg,#071024,#081426);color:#e6eef8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px}
-  .app{width:100%;max-width:1100px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.06));border-radius:12px;overflow:hidden;display:grid;grid-template-columns:320px 1fr;gap:16px;padding:16px}
-  .panel{background:var(--card);padding:12px;border-radius:10px}
-  h1{margin:0 0 8px 0}
-  .muted{color:var(--muted);font-size:13px}
-  input, textarea, select{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
-  button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:#041025;cursor:pointer;font-weight:600}
-  button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);color:var(--muted)}
-  .user-item{display:flex;align-items:center;justify-content:space-between;padding:8px;border-radius:8px;margin-top:6px;background:rgba(255,255,255,0.01)}
-  .status-dot{width:10px;height:10px;border-radius:50%}
-  .online{background:#2ee6a8}
-  .offline{background:#374258}
-  #videos{display:flex;gap:12px}
-  video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:cover}
-  .local-small{width:220px;height:140px;position:relative;border-radius:8px;overflow:hidden}
-  #incoming{position:absolute;left:50%;transform:translateX(-50%);top:10px;background:linear-gradient(90deg,#3a2bff,#00e6b8);padding:12px;border-radius:10px;display:none;z-index:20}
-  .controls{display:flex;gap:8px;align-items:center;margin-top:8px}
-  .danger{background:var(--danger);color:white}
-  #chat{height:220px;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;overflow:auto}
-  .msg{margin-bottom:8px}
-  .note{font-size:13px;color:var(--muted)}
-  @media(max-width:900px){ .app{grid-template-columns:1fr} .local-small{width:160px;height:110px} }
+:root{--bg:#071026;--card:#0d1726;--muted:#9aa9c3;--accent:#7c5cff;--danger:#ff6b6b}
+*{box-sizing:border-box;font-family:Inter, Arial, sans-serif}
+body{margin:0;background:linear-gradient(180deg,#071024,#081426);color:#e6eef8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px}
+.app{width:100%;max-width:1100px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.06));border-radius:12px;overflow:hidden;display:grid;grid-template-columns:320px 1fr;gap:16px;padding:16px}
+.panel{background:var(--card);padding:12px;border-radius:10px}
+h1{margin:0 0 8px 0}
+.muted{color:var(--muted);font-size:13px}
+input, textarea{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:#041025;cursor:pointer;font-weight:600}
+button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);color:var(--muted)}
+.user-item{display:flex;align-items:center;justify-content:space-between;padding:8px;border-radius:8px;margin-top:6px;background:rgba(255,255,255,0.01)}
+.status-dot{width:10px;height:10px;border-radius:50%}
+.online{background:#2ee6a8}
+.offline{background:#374258}
+#videos{display:flex;gap:12px}
+video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:cover}
+.local-small{width:220px;height:140px;position:relative;border-radius:8px;overflow:hidden}
+#incoming{position:absolute;left:50%;transform:translateX(-50%);top:10px;background:linear-gradient(90deg,#3a2bff,#00e6b8);padding:12px;border-radius:10px;display:none;z-index:20}
+.controls{display:flex;gap:8px;align-items:center;margin-top:8px}
+.danger{background:var(--danger);color:white}
+#chat{height:220px;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;overflow:auto}
+.msg{margin-bottom:8px}
+.note{font-size:13px;color:var(--muted)}
+@media(max-width:900px){ .app{grid-template-columns:1fr} .local-small{width:160px;height:110px} }
 </style>
 </head>
 <body>
@@ -252,7 +335,7 @@ function renderHTML() {
 
   <div class="panel" style="display:flex;flex-direction:column;height:80vh">
     <div style="display:flex;align-items:center;justify-content:space-between">
-      <div><h1>SkyMessage</h1><div class="muted">Демо: WebRTC + Chat</div></div>
+      <div><h1>SkyMessage</h1><div class="muted">Сохранение в SQLite</div></div>
       <div class="note" id="status">Отключено</div>
     </div>
 
@@ -284,7 +367,7 @@ function renderHTML() {
     </div>
 
     <div style="margin-top:auto;font-size:12px;color:var(--muted)">
-      Демо — без БД. Для продакшна: HTTPS, TURN, хеш паролей.
+      Демо — SQLite локально. Для продакшн: HTTPS, TURN, хеш паролей.
     </div>
   </div>
 
@@ -354,7 +437,7 @@ function renderHTML() {
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-/* Client script: Socket.IO + WebRTC + Chat (embedded) */
+/* Client script (embedded) */
 const socket = io();
 let me = { username: null, displayName: null };
 let pc = null, localStream = null, remoteStream = null;
@@ -398,12 +481,11 @@ const btnClear = document.getElementById('btn-clear');
 
 let micMuted = false, camOn = false;
 
-// util
 function logChat(text, who='') {
   const d = document.createElement('div'); d.className = 'msg';
   d.textContent = (who ? who + ': ' : '') + text;
   chatEl.appendChild(d);
-  chatEl.scrollTop = chatEl.scrollHeight; // auto-scroll
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 function getCookie(name) {
@@ -411,11 +493,11 @@ function getCookie(name) {
   return v ? v.pop() : '';
 }
 
-// ---------------- Auth via HTTP ----------------
+// ---------- Auth ----------
 btnRegister.onclick = async () => {
   const username = regLogin.value.trim(), password = regPass.value;
   if (!username || !password) return alert('Введите логин и пароль');
-  const res = await fetch('/api/register', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, password })});
+  const res = await fetch('/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, password })});
   const data = await res.json();
   if (data.ok) alert('Готово, теперь войдите'); else alert(data.error || 'Ошибка');
 };
@@ -423,23 +505,22 @@ btnRegister.onclick = async () => {
 btnLogin.onclick = async () => {
   const username = regLogin.value.trim(), password = regPass.value;
   if (!username || !password) return alert('Введите логин и пароль');
-  const res = await fetch('/api/login', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, password })});
+  const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ username, password })});
   const data = await res.json();
   if (data.ok) {
     me.username = username; me.displayName = data.displayName || username;
     authBlock.style.display = 'none'; loggedBlock.style.display = 'block';
     meNameEl.textContent = me.username;
     statusEl.textContent = 'Socket: подключение...';
-    // notify socket
     socket.emit('socket-login', me.username);
-    await prepareLocalMedia(); // mic only
+    await prepareLocalMedia();
     refreshUsers('');
   } else {
     alert(data.error || 'Ошибка входа');
   }
 };
 
-// ---------------- Users list ----------------
+// ---------- Users ----------
 btnSearch.onclick = () => refreshUsers(searchQ.value.trim());
 async function refreshUsers(q='') {
   const res = await fetch('/api/users?q=' + encodeURIComponent(q || ''));
@@ -447,25 +528,14 @@ async function refreshUsers(q='') {
   usersListEl.innerHTML = '';
   list.forEach(u => {
     const item = document.createElement('div'); item.className = 'user-item';
-    item.innerHTML = \`
-      <div style="display:flex;gap:10px;align-items:center">
-        <div style="width:36px;height:36px;border-radius:8px;background:linear-gradient(135deg,#7c5cff,#4ce1b6);display:flex;align-items:center;justify-content:center;font-weight:700;color:#041025">\${u.username[0].toUpperCase()}</div>
-        <div><div style="font-weight:700">\${u.displayName}</div><div class="muted small">\${u.username}</div></div>
-      </div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end">
-        <div class="status-dot \${u.online ? 'online' : 'offline'}"></div>
-        <div style="margin-top:8px;display:flex;gap:6px">
-          <button class="ghost btn-chat" data-user="\${u.username}">Чат</button>
-          <button class="btn-call-user" data-user="\${u.username}">Позвонить</button>
-        </div>
-      </div>\`;
+    item.innerHTML = '<div style="display:flex;gap:10px;align-items:center"><div style="width:36px;height:36px;border-radius:8px;background:linear-gradient(135deg,#7c5cff,#4ce1b6);display:flex;align-items:center;justify-content:center;font-weight:700;color:#041025">' + u.username[0].toUpperCase() + '</div><div style="margin-left:8px"><div style="font-weight:700">'+u.displayName+'</div><div class="muted small">'+u.username+'</div></div></div><div style="display:flex;flex-direction:column;align-items:flex-end"><div class="status-dot ' + (u.online? 'online' : 'offline') + '"></div><div style="margin-top:8px;display:flex;gap:6px"><button class="ghost btn-chat" data-user="'+u.username+'">Чат</button><button class="btn-call-user" data-user="'+u.username+'">Позвонить</button></div></div>';
     usersListEl.appendChild(item);
     item.querySelector('.btn-call-user').onclick = () => initiateCallTo(u.username);
     item.querySelector('.btn-chat').onclick = () => openChatWith(u.username);
   });
 }
 
-// open chat with user -> load history
+// load history
 async function openChatWith(user) {
   if (!me.username) return alert('Сначала войдите');
   callTargetInput.value = user;
@@ -473,11 +543,11 @@ async function openChatWith(user) {
   const data = await res.json();
   if (data.ok) {
     chatEl.innerHTML = '';
-    data.messages.forEach(m => logChat(m.text, m.from === me.username ? 'Вы' : m.from));
+    data.messages.forEach(m => logChat(m.text, m.fromUser === me.username ? 'Вы' : m.fromUser));
   }
 }
 
-// ---------------- Socket events ----------------
+// ---------- Socket events ----------
 socket.on('connect', () => {
   statusEl.textContent = 'Socket: connected';
   const cookieUser = getCookie('username');
@@ -491,19 +561,15 @@ socket.on('connect', () => {
   }
 });
 
-socket.on('users-updated', () => {
-  // refresh small current list
-  refreshUsers(searchQ.value.trim());
-});
+socket.on('users-updated', () => refreshUsers(searchQ.value.trim()));
 
-socket.on('incoming-call', ({ from, displayName }) => {
+socket.on('incoming-call', ({ from }) => {
   incomingBox.style.display = 'block';
-  incomingFrom.textContent = 'От: ' + (displayName || from);
+  incomingFrom.textContent = 'От: ' + from;
   pendingOffer = { from };
 });
 
 socket.on('offer', async ({ from, sdp }) => {
-  // store pending offer
   pendingOffer = { from, sdp };
   incomingBox.style.display = 'block';
   incomingFrom.textContent = 'От: ' + from;
@@ -513,10 +579,9 @@ socket.on('answer', async ({ from, sdp }) => {
   if (!pc) return;
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    // drain queued ICE
     while (iceQueue.length) {
       const c = iceQueue.shift();
-      try { await pc.addIceCandidate(c); } catch(e){ console.warn('ice add fail', e); }
+      try { await pc.addIceCandidate(c); } catch(e){}
     }
   } catch (e) { console.error(e); }
 });
@@ -529,7 +594,7 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
     } else {
       iceQueue.push(c);
     }
-  } catch (e) { console.warn('ice candidate error', e); }
+  } catch (e) { console.warn(e); }
 });
 
 socket.on('end-call', ({ from }) => {
@@ -542,14 +607,14 @@ socket.on('chat-message', ({ from, text, ts }) => {
 });
 
 socket.on('chat-acked', ({ to, text, ts }) => {
-  // ack can be used for UI status, currently we already appended
+  // noop
 });
 
-// ---------------- Media & WebRTC ----------------
+// ---------- Media & WebRTC ----------
 async function prepareLocalMedia() {
   if (localStream) return;
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    localStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false });
     localVideo.srcObject = localStream;
     micMuted = false; btnMic.textContent = 'Мик выкл';
   } catch (e) {
@@ -563,25 +628,13 @@ function createPeerConnection(target) {
   currentPeer = target;
   remoteStream = new MediaStream();
   remoteVideo.srcObject = remoteStream;
-
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  pc.ontrack = (ev) => {
-    ev.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
-  };
-
-  pc.onicecandidate = (ev) => {
-    if (ev.candidate) socket.emit('ice-candidate', { to: target, candidate: ev.candidate });
-  };
-
+  pc.ontrack = (ev) => ev.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
+  pc.onicecandidate = (ev) => { if (ev.candidate) socket.emit('ice-candidate', { to: target, candidate: ev.candidate }); };
   pc.onconnectionstatechange = () => {
     if (!pc) return;
-    if (pc.connectionState === 'connected') {
-      logChat('Соединение установлено', 'System');
-    }
-    if (['disconnected','failed','closed'].includes(pc.connectionState)) {
-      endCallLocal();
-    }
+    if (pc.connectionState === 'connected') logChat('Соединение установлено', 'System');
+    if (['disconnected','failed','closed'].includes(pc.connectionState)) endCallLocal();
   };
 }
 
@@ -590,15 +643,15 @@ async function initiateCallTo(target) {
   if (!target) return alert('Укажите логин для звонка');
   if (target === me.username) return alert('Нельзя позвонить себе');
   socket.emit('call', { to: target }, async (res) => {
-    if (!res || !res.ok) return alert('Не получилось дозвониться: ' + (res && res.error));
+    if (!res || !res.ok) return alert('Не удалось дозвониться: ' + (res && res.error));
     await prepareLocalMedia();
     createPeerConnection(target);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('offer', { to: target, sdp: offer });
-    callInfo.textContent = 'Звонок: ' + target;
-    remoteName.textContent = target;
+    callInfo.textContent = 'Звонок: ' + target; remoteName.textContent = target;
     btnEnd.classList.remove('hide'); btnCall.classList.add('hide');
+    logChat('Исходящий звонок ' + target, 'System');
   });
 }
 
@@ -609,49 +662,34 @@ async function acceptIncoming() {
   await prepareLocalMedia();
   createPeerConnection(from);
   try {
-    if (pendingOffer.sdp) {
-      await pc.setRemoteDescription(new RTCSessionDescription(pendingOffer.sdp));
-    }
+    if (pendingOffer.sdp) await pc.setRemoteDescription(new RTCSessionDescription(pendingOffer.sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     socket.emit('answer', { to: from, sdp: answer });
-    callInfo.textContent = 'Разговор с ' + from;
-    remoteName.textContent = from;
+    callInfo.textContent = 'Разговор с ' + from; remoteName.textContent = from;
     btnEnd.classList.remove('hide'); btnCall.classList.add('hide');
     pendingOffer = null;
-  } catch (e) {
-    console.error(e);
-  }
+  } catch (e) { console.error(e); }
 }
 
 function declineIncoming() {
-  if (pendingOffer && pendingOffer.from) {
-    socket.emit('end-call', { to: pendingOffer.from });
-  }
-  incomingBox.style.display = 'none';
-  pendingOffer = null;
+  if (pendingOffer && pendingOffer.from) socket.emit('end-call', { to: pendingOffer.from });
+  incomingBox.style.display = 'none'; pendingOffer = null;
 }
 
 function endCallLocal() {
   try {
     if (pc) {
-      pc.getSenders().forEach(s => { try { if (s.track) s.track.stop(); } catch(e){} });
+      pc.getSenders().forEach(s => { try { if (s.track) s.track.stop(); } catch(e) {} });
       pc.close(); pc = null;
     }
-    // keep mic stream for quicker re-call (do not stop audio tracks by default)
-    if (localStream && localStream.getVideoTracks) {
-      // stop video tracks if any
-      localStream.getVideoTracks().forEach(t => t.stop());
-    }
-    remoteVideo.srcObject = null;
-    currentPeer = null;
+    if (localStream && localStream.getVideoTracks) localStream.getVideoTracks().forEach(t => t.stop());
+    remoteVideo.srcObject = null; currentPeer = null;
     btnEnd.classList.add('hide'); btnCall.classList.remove('hide');
-    callInfo.textContent = 'Ожидание';
-    remoteName.textContent = '—';
+    callInfo.textContent = 'Ожидание'; remoteName.textContent = '—';
   } catch (e) { console.warn(e); }
 }
 
-// Toggle mic
 function toggleMic() {
   if (!localStream) return;
   micMuted = !micMuted;
@@ -659,76 +697,53 @@ function toggleMic() {
   btnMic.textContent = micMuted ? 'Мик вкл' : 'Мик выкл';
 }
 
-// Toggle camera (on demand)
 async function toggleCam() {
-  if (!localStream) {
-    await prepareLocalMedia();
-  }
+  if (!localStream) await prepareLocalMedia();
   if (!localStream.getVideoTracks().length) {
     try {
       const cam = await navigator.mediaDevices.getUserMedia({ video: true });
       cam.getVideoTracks().forEach(track => localStream.addTrack(track));
       localVideo.srcObject = localStream;
-      // add to existing pc
       if (pc) cam.getVideoTracks().forEach(track => pc.addTrack(track, localStream));
       camOn = true; btnCam.textContent = 'Выкл кам';
-    } catch (e) {
-      alert('Не удалось включить камеру: ' + e.message);
-    }
+    } catch (e) { alert('Не удалось включить камеру: ' + e.message); }
   } else {
     const cur = localStream.getVideoTracks();
     cur.forEach(t => t.enabled = !t.enabled);
-    camOn = cur[0].enabled;
-    btnCam.textContent = camOn ? 'Выкл кам' : 'Вкл кам';
+    camOn = cur[0].enabled; btnCam.textContent = camOn ? 'Выкл кам' : 'Вкл кам';
   }
 }
 
-// Fullscreen remote
 function toggleFull() {
   if (!document.fullscreenElement) remoteVideo.requestFullscreen().catch(()=>{});
   else document.exitFullscreen();
 }
 
-// ---------------- Chat send ----------------
+// ---------- Chat ----------
 btnSend.onclick = () => {
-  const text = msgInput.value.trim();
-  const to = callTargetInput.value.trim();
+  const text = msgInput.value.trim(), to = callTargetInput.value.trim();
   if (!text || !to) return alert('Введите сообщение и укажите получателя (справа)');
   socket.emit('chat-message', { to, text }, (res) => {
-    if (!res || !res.ok) return alert('Не удалось отправить сообщение: ' + (res && res.error));
-    logChat(text, 'Вы');
-    msgInput.value = '';
+    if (!res || !res.ok) return alert('Не удалось отправить: ' + (res && res.error));
+    logChat(text, 'Вы'); msgInput.value = '';
   });
 };
 
-btnCallTarget.onclick = () => {
-  const t = callTargetInput.value.trim();
-  if (t) initiateCallTo(t);
-};
-
+btnCallTarget.onclick = () => { const t = callTargetInput.value.trim(); if (t) initiateCallTo(t); };
 btnClear.onclick = () => { chatEl.innerHTML = ''; };
 
-// incoming controls
 btnAccept.onclick = acceptIncoming;
 btnDecline.onclick = declineIncoming;
-
-// call controls
 btnCall.onclick = () => {
   const t = callTargetInput.value.trim() || prompt('Кому позвонить? Введите логин:');
   if (t) initiateCallTo(t);
 };
-btnEnd.onclick = () => {
-  if (currentPeer) socket.emit('end-call', { to: currentPeer });
-  endCallLocal();
-};
+btnEnd.onclick = () => { if (currentPeer) socket.emit('end-call', { to: currentPeer }); endCallLocal(); };
 btnMic.onclick = toggleMic;
 btnCam.onclick = toggleCam;
 btnFull.onclick = toggleFull;
 
-// ensure socket disconnect cleanup on page unload
-window.addEventListener('beforeunload', () => {
-  try { if (me.username) socket.disconnect(); } catch(e){}
-});
+window.addEventListener('beforeunload', () => { try { if (me.username) socket.disconnect(); } catch(e){} });
 
 </script>
 </body>
