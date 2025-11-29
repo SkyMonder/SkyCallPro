@@ -1,17 +1,16 @@
 {
-  "name": "skycall",
+  "name": "skymessage",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "cookie-parser": "^1.4.7",
-    "express": "^4.21.2",
-    "ws": "^8.18.3"
+    "express": "^4.18.2",
+    "socket.io": "^4.9.1",
+    "cookie-parser": "^1.4.6"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": ""
+  "engines": {
+    "node": ">=18"
+  }
 }
