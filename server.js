@@ -291,7 +291,6 @@ io.on('connection', (socket) => {
 });
 
 // ----------------- start server -----------------
-// 🛑 ИСПРАВЛЕНИЕ: Удалено повторное объявление 'const server = http.createServer(app);'
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`SkyMessage running on http://0.0.0.0:${PORT} (port ${PORT})`);
 });
@@ -356,7 +355,7 @@ video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:co
           <button id="btn-logout" class="ghost">Выйти</button>
           <button id="btn-copy" class="ghost">Копировать</button>
         </div>
-        </div>
+      </div>
     </div>
 
     <div style="margin-top:16px">
@@ -427,7 +426,6 @@ video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:co
               <button id="btn-call-target">Позвонить</button>
               <button id="btn-clear" class="ghost">Очистить чат</button>
             </div>
-          </div>
         </div>
       </div>
 
