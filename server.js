@@ -291,7 +291,7 @@ io.on('connection', (socket) => {
 });
 
 // ----------------- start server -----------------
-const server = http.createServer(app); // Re-added the declaration in case it was missing in the provided code block structure
+// 🛑 ИСПРАВЛЕНИЕ: Удалено повторное объявление 'const server = http.createServer(app);'
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`SkyMessage running on http://0.0.0.0:${PORT} (port ${PORT})`);
 });
@@ -356,7 +356,7 @@ video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:co
           <button id="btn-logout" class="ghost">Выйти</button>
           <button id="btn-copy" class="ghost">Копировать</button>
         </div>
-      </div>
+        </div>
     </div>
 
     <div style="margin-top:16px">
@@ -441,7 +441,7 @@ video{background:#050814;border-radius:8px;flex:1;min-height:240px;object-fit:co
 /* Client script (embedded) */
 const socket = io();
 let me = { username: null, displayName: null };
-let pc = null, localStream = null; // remoteStream removed as it's directly attached
+let pc = null, localStream = null; 
 let currentPeer = null, pendingOffer = null;
 let iceQueue = [];
 
